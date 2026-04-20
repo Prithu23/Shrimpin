@@ -1,492 +1,292 @@
 """
-Posture Detector - "Are You Shrimpin'?"
-Real-time posture detection using OpenCV + MediaPipe.
+Posture Detector - Are You Shrimpin'?
+Detects hunching using OpenCV + MediaPipe Pose.
+Exposes hunch count on http://localhost:8765/status so posture.html can poll it.
 
-Setup:
-    pip install opencv-python mediapipe numpy
-
-Usage:
-    cd Posture_detector_shrimp
-    python posture_detector.py
+Install:
+    pip install opencv-python mediapipe
 
 Controls:
     q - Quit
-    c - Recalibrate
-    1 - Strict sensitivity
-    2 - Normal sensitivity (default)
-    3 - Relaxed sensitivity
 """
 
 import cv2
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import numpy as np
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.core import base_options as mp_base
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import time
 import math
-import subprocess
 import threading
-
-
-# ---------------------------------------------------------------------------
-# Sound Alert
-# ---------------------------------------------------------------------------
-
-def play_alert_sound():
-    """Play a non-blocking alert sound. macOS uses afplay; fallback is terminal bell."""
-    def _play():
-        try:
-            subprocess.run(
-                ["afplay", "/System/Library/Sounds/Sosumi.aiff"],
-                check=False, timeout=3,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print("\a", end="", flush=True)
-
-    threading.Thread(target=_play, daemon=True).start()
+import urllib.request
+import os
+import winsound
 
 
 # ---------------------------------------------------------------------------
 # Landmark indices
 # ---------------------------------------------------------------------------
 
-# Eyes
-LEFT_EYE_INNER, LEFT_EYE, LEFT_EYE_OUTER = 1, 2, 3
-RIGHT_EYE_INNER, RIGHT_EYE, RIGHT_EYE_OUTER = 4, 5, 6
-EYE_INDICES = [1, 2, 3, 4, 5, 6]
-
-# Other upper-body landmarks
-NOSE = 0
-LEFT_EAR, RIGHT_EAR = 7, 8
-LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
-LEFT_HIP, RIGHT_HIP = 23, 24
-
-TRACKED_INDICES = [NOSE] + EYE_INDICES + [
-    LEFT_EAR, RIGHT_EAR,
-    LEFT_SHOULDER, RIGHT_SHOULDER,
-    LEFT_HIP, RIGHT_HIP,
-]
-
-# Connections to draw
-SKELETON_CONNECTIONS = [
-    (LEFT_EAR, LEFT_SHOULDER),
-    (RIGHT_EAR, RIGHT_SHOULDER),
-    (LEFT_SHOULDER, LEFT_HIP),
-    (RIGHT_SHOULDER, RIGHT_HIP),
-    (LEFT_SHOULDER, RIGHT_SHOULDER),
-    (NOSE, LEFT_EAR),
-    (NOSE, RIGHT_EAR),
-    (LEFT_EYE, NOSE),
-    (RIGHT_EYE, NOSE),
-]
+NOSE          = 0
+LEFT_EAR      = 7
+RIGHT_EAR     = 8
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER= 12
+LEFT_HIP      = 23
+RIGHT_HIP     = 24
 
 
 # ---------------------------------------------------------------------------
-# Sensitivity presets
+# Helpers
 # ---------------------------------------------------------------------------
 
-SENSITIVITY = {
-    #               entry_offset, exit_offset, required_frames
-    "strict":  (10, 3, 8),
-    "normal":  (15, 5, 10),
-    "relaxed": (20, 8, 15),
-}
+def angle_at_b(a, b, c):
+    """Angle (degrees) at point b formed by a-b-c."""
+    ba = (a.x - b.x, a.y - b.y)
+    bc = (c.x - b.x, c.y - b.y)
+    dot = ba[0]*bc[0] + ba[1]*bc[1]
+    mag = math.sqrt(ba[0]**2+ba[1]**2) * math.sqrt(bc[0]**2+bc[1]**2)
+    if mag < 1e-6:
+        return 0.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot/mag))))
+
+
+def neck_angle(lm):
+    """Average ear-shoulder-hip angle. Increases when you hunch forward."""
+    left  = angle_at_b(lm[LEFT_EAR],   lm[LEFT_SHOULDER],  lm[LEFT_HIP])
+    right = angle_at_b(lm[RIGHT_EAR],  lm[RIGHT_SHOULDER], lm[RIGHT_HIP])
+    return (left + right) / 2.0
+
+
+def play_beep():
+    threading.Thread(
+        target=lambda: winsound.Beep(880, 300),
+        daemon=True
+    ).start()
+
+
+def put_text(frame, text, pos, scale=0.65, color=(255,255,255), thickness=2):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(frame, text, (pos[0]+1, pos[1]+1), font, scale, (0,0,0), thickness+1, cv2.LINE_AA)
+    cv2.putText(frame, text, pos,                  font, scale, color,   thickness,   cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
-# PostureDetector
+# Shared state (read by HTTP server, written by detector)
 # ---------------------------------------------------------------------------
+
+shared_state  = {"count": 0, "is_hunching": False}
+latest_frame  = None
+frame_lock    = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# HTTP server — /status (JSON) + /video (MJPEG stream)
+# ---------------------------------------------------------------------------
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/video":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                while True:
+                    with frame_lock:
+                        frame = latest_frame
+                    if frame is not None:
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                        self.wfile.write(frame)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(0.033)
+            except Exception:
+                pass
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(shared_state).encode())
+
+    def log_message(self, *_):
+        pass
+
+
+def start_status_server(port=8765):
+    ThreadingHTTPServer(("localhost", port), _Handler).serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# Detector state
+# ---------------------------------------------------------------------------
+
+HUNCH_THRESHOLD = 145   # angle below this = hunching
+EXIT_THRESHOLD  = 150   # angle must rise above this to clear hunch (hysteresis)
+REQUIRED_FRAMES = 8     # consecutive bad frames before counting as a hunch
+
 
 class PostureDetector:
-    def __init__(self, sensitivity="normal"):
-        # Calibration state
-        self.calibrated = False
-        self.calibration_data = []
-        self.calibration_wait_start = None  # for the 3-second countdown
-        self.baseline_angle = None
+    def __init__(self):
+        self.is_hunching = False
+        self.consec_bad  = 0
+        self.hunch_count = 0
+        self.last_beep   = 0.0
 
-        # Thresholds (set after calibration)
-        self.entry_threshold = 35.0
-        self.exit_threshold = 25.0
-        self.required_frames = 10
+    def analyze(self, lm):
+        angle = neck_angle(lm)
 
-        # Detection state
-        self.is_shrimping = False
-        self.consecutive_bad = 0
-        self.shrimp_count = 0
-        self.bad_posture_start = None
-        self.last_alert_time = 0.0
-
-        # Timing
-        self.session_start = None
-        self.total_bad_seconds = 0.0
-
-        self.set_sensitivity(sensitivity)
-
-    # --- sensitivity ---
-
-    def set_sensitivity(self, level):
-        self.sensitivity = level
-        entry_off, exit_off, req = SENSITIVITY[level]
-        self.required_frames = req
-        if self.baseline_angle is not None:
-            self.entry_threshold = self.baseline_angle + entry_off
-            self.exit_threshold = self.baseline_angle + exit_off
-
-    def reset_calibration(self):
-        self.calibrated = False
-        self.calibration_data = []
-        self.calibration_wait_start = None
-        self.baseline_angle = None
-        self.is_shrimping = False
-        self.consecutive_bad = 0
-        self.bad_posture_start = None
-
-    # --- math helpers ---
-
-    @staticmethod
-    def _calc_angle(a, b, c):
-        """Angle at vertex b formed by points a-b-c, in degrees."""
-        ba = (a.x - b.x, a.y - b.y)
-        bc = (c.x - b.x, c.y - b.y)
-        dot = ba[0] * bc[0] + ba[1] * bc[1]
-        mag_a = math.sqrt(ba[0] ** 2 + ba[1] ** 2)
-        mag_c = math.sqrt(bc[0] ** 2 + bc[1] ** 2)
-        if mag_a == 0 or mag_c == 0:
-            return 0.0
-        cos_angle = max(-1.0, min(1.0, dot / (mag_a * mag_c)))
-        return math.degrees(math.acos(cos_angle))
-
-    # --- posture metrics ---
-
-    def _calc_neck_angle(self, lm):
-        """Average ear-shoulder-hip angle (left + right)."""
-        left = self._calc_angle(lm[LEFT_EAR], lm[LEFT_SHOULDER], lm[LEFT_HIP])
-        right = self._calc_angle(lm[RIGHT_EAR], lm[RIGHT_SHOULDER], lm[RIGHT_HIP])
-        return (left + right) / 2.0
-
-    def _calc_forward_head(self, lm):
-        """How far nose is ahead of shoulders (z-axis). Larger = more forward."""
-        mid_z = (lm[LEFT_SHOULDER].z + lm[RIGHT_SHOULDER].z) / 2.0
-        return mid_z - lm[NOSE].z
-
-    def _calc_shoulder_slope(self, lm):
-        """Absolute y-difference between shoulders (0 = level)."""
-        return abs(lm[LEFT_SHOULDER].y - lm[RIGHT_SHOULDER].y)
-
-    def _calc_ear_shoulder_dist(self, lm):
-        """Vertical distance from ear midpoint to shoulder midpoint."""
-        ear_y = (lm[LEFT_EAR].y + lm[RIGHT_EAR].y) / 2.0
-        shldr_y = (lm[LEFT_SHOULDER].y + lm[RIGHT_SHOULDER].y) / 2.0
-        return shldr_y - ear_y
-
-    # --- calibration ---
-
-    CALIBRATION_WAIT = 3.0   # seconds to wait before collecting
-    CALIBRATION_FRAMES = 45  # frames to collect
-
-    def calibrate_frame(self, landmarks):
-        """Feed one frame during calibration. Returns True when done."""
-        now = time.time()
-
-        # Start the countdown timer on first call
-        if self.calibration_wait_start is None:
-            self.calibration_wait_start = now
-
-        # Still in countdown?
-        elapsed = now - self.calibration_wait_start
-        if elapsed < self.CALIBRATION_WAIT:
-            return False
-
-        # Collect data
-        self.calibration_data.append(self._calc_neck_angle(landmarks))
-
-        if len(self.calibration_data) >= self.CALIBRATION_FRAMES:
-            self.baseline_angle = sum(self.calibration_data) / len(self.calibration_data)
-            # Apply current sensitivity offsets
-            entry_off, exit_off, _ = SENSITIVITY[self.sensitivity]
-            self.entry_threshold = self.baseline_angle + entry_off
-            self.exit_threshold = self.baseline_angle + exit_off
-            self.calibrated = True
-            self.session_start = time.time()
-            return True
-
-        return False
-
-    def calibration_progress(self):
-        """Returns (countdown_remaining, frames_collected, frames_needed)."""
-        if self.calibration_wait_start is None:
-            return self.CALIBRATION_WAIT, 0, self.CALIBRATION_FRAMES
-        elapsed = time.time() - self.calibration_wait_start
-        countdown = max(0.0, self.CALIBRATION_WAIT - elapsed)
-        return countdown, len(self.calibration_data), self.CALIBRATION_FRAMES
-
-    # --- analysis ---
-
-    def analyze_posture(self, landmarks):
-        """Analyze one frame. Returns a metrics dict."""
-        neck_angle = self._calc_neck_angle(landmarks)
-        forward_head = self._calc_forward_head(landmarks)
-        shoulder_slope = self._calc_shoulder_slope(landmarks)
-        ear_shoulder = self._calc_ear_shoulder_dist(landmarks)
-
-        # Hysteresis: use different threshold depending on current state
-        if self.is_shrimping:
-            is_bad = neck_angle > self.exit_threshold
-        else:
-            is_bad = neck_angle > self.entry_threshold
+        is_bad = angle < (EXIT_THRESHOLD if self.is_hunching else HUNCH_THRESHOLD)
 
         if is_bad:
-            self.consecutive_bad += 1
+            self.consec_bad += 1
         else:
-            self.consecutive_bad = 0
+            self.consec_bad = 0
 
-        # Transition to shrimping
-        if not self.is_shrimping and self.consecutive_bad >= self.required_frames:
-            self.is_shrimping = True
-            self.consecutive_bad = 0
-            self.shrimp_count += 1
-            self.bad_posture_start = time.time()
+        # Good → hunching
+        if not self.is_hunching and self.consec_bad >= REQUIRED_FRAMES:
+            self.is_hunching = True
+            self.consec_bad  = 0
+            self.hunch_count += 1
+            shared_state["count"]       = self.hunch_count
+            shared_state["is_hunching"] = True
+            now = time.time()
+            if now - self.last_beep > 3.0:
+                play_beep()
+                self.last_beep = now
 
-        # Transition to good posture
-        if self.is_shrimping and self.consecutive_bad == 0 and neck_angle <= self.exit_threshold:
-            if self.bad_posture_start:
-                self.total_bad_seconds += time.time() - self.bad_posture_start
-            self.is_shrimping = False
-            self.bad_posture_start = None
+        # Hunching → good
+        if self.is_hunching and not is_bad:
+            self.is_hunching            = False
+            shared_state["is_hunching"] = False
 
-        bad_seconds = 0.0
-        if self.is_shrimping and self.bad_posture_start:
-            bad_seconds = time.time() - self.bad_posture_start
+        return angle
 
-        return {
-            "neck_angle": neck_angle,
-            "baseline_angle": self.baseline_angle,
-            "forward_head": forward_head,
-            "shoulder_slope": shoulder_slope,
-            "ear_shoulder_dist": ear_shoulder,
-            "is_shrimping": self.is_shrimping,
-            "shrimp_count": self.shrimp_count,
-            "bad_seconds": bad_seconds,
-            "total_bad_seconds": self.total_bad_seconds + bad_seconds,
-        }
 
-    # --- drawing ---
+# ---------------------------------------------------------------------------
+# Drawing
+# ---------------------------------------------------------------------------
 
-    def draw_skeleton(self, frame, landmarks, analysis):
-        """Draw tracked landmarks and connections on the frame."""
-        h, w = frame.shape[:2]
-        is_bad = analysis["is_shrimping"] if analysis else False
+def draw_hud(frame, detector, angle):
+    h, w = frame.shape[:2]
 
-        color_point = (0, 0, 220) if is_bad else (0, 200, 0)
-        color_line = (0, 0, 180) if is_bad else (0, 180, 0)
-        color_outline = (255, 255, 255)
+    if detector.is_hunching:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 180), -1)
+        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
 
-        # Draw connections
-        for (i, j) in SKELETON_CONNECTIONS:
-            a, b = landmarks[i], landmarks[j]
-            if a.visibility > 0.5 and b.visibility > 0.5:
-                pt1 = (int(a.x * w), int(a.y * h))
-                pt2 = (int(b.x * w), int(b.y * h))
-                cv2.line(frame, pt1, pt2, color_line, 2, cv2.LINE_AA)
+    status_color = (0, 0, 255) if detector.is_hunching else (0, 220, 0)
+    status_text  = "HUNCHING!" if detector.is_hunching else "Good posture"
+    put_text(frame, f"Hunch count: {detector.hunch_count}", (15, 35), 0.75, (255, 255, 255))
+    put_text(frame, f"Status: {status_text}",               (15, 65), 0.65, status_color)
+    put_text(frame, f"Angle: {angle:.1f}  (hunch < {HUNCH_THRESHOLD})", (15, 92), 0.5, (180, 180, 180))
 
-        # Draw points
-        for idx in TRACKED_INDICES:
-            lm = landmarks[idx]
-            if lm.visibility > 0.5:
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                cv2.circle(frame, (cx, cy), 6, color_point, -1, cv2.LINE_AA)
-                cv2.circle(frame, (cx, cy), 6, color_outline, 1, cv2.LINE_AA)
+    if detector.is_hunching and time.time() % 1.0 < 0.55:
+        msg = "STRAIGHTEN UP!"
+        sz  = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)[0]
+        put_text(frame, msg, ((w - sz[0]) // 2, (h + sz[1]) // 2), 1.1, (0, 0, 255), 3)
 
-    def draw_overlay(self, frame, analysis):
-        """Draw the HUD overlay (stats, alerts, controls help)."""
-        h, w = frame.shape[:2]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        is_bad = analysis["is_shrimping"]
+    put_text(frame, "q: Quit", (15, h - 15), 0.45, (150, 150, 150), 1)
 
-        # --- red tint when shrimping ---
-        if is_bad:
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
-            cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
 
-        # --- top-left stats ---
-        y = 30
-        self._put_text(frame, f"Shrimp Count: {analysis['shrimp_count']}", (15, y), font, 0.65, (255, 255, 255))
-        y += 28
-        self._put_text(frame, f"Neck Angle: {analysis['neck_angle']:.1f} (baseline: {analysis['baseline_angle']:.1f})",
-                       (15, y), font, 0.55, (200, 200, 200))
-        y += 25
-        status_text = "SHRIMPING!" if is_bad else "GOOD POSTURE"
-        status_color = (0, 0, 255) if is_bad else (0, 255, 0)
-        self._put_text(frame, f"Status: {status_text}", (15, y), font, 0.6, status_color)
+POSE_CONNECTIONS = [
+    (LEFT_EAR, LEFT_SHOULDER), (RIGHT_EAR, RIGHT_SHOULDER),
+    (LEFT_SHOULDER, RIGHT_SHOULDER),
+    (LEFT_SHOULDER, LEFT_HIP), (RIGHT_SHOULDER, RIGHT_HIP),
+    (NOSE, LEFT_EAR), (NOSE, RIGHT_EAR),
+]
 
-        if is_bad and analysis["bad_seconds"] > 0:
-            y += 25
-            self._put_text(frame, f"Bad posture for {analysis['bad_seconds']:.0f}s", (15, y), font, 0.55, (0, 100, 255))
+def _vis(lm):
+    return getattr(lm, 'visibility', 1.0) or 1.0
 
-        # --- pulsing center alert ---
-        if is_bad and time.time() % 1.0 < 0.6:
-            text = "STRAIGHTEN UP!"
-            text_size = cv2.getTextSize(text, font, 1.2, 3)[0]
-            tx = (w - text_size[0]) // 2
-            ty = (h + text_size[1]) // 2
-            self._put_text(frame, text, (tx, ty), font, 1.2, (0, 0, 255), thickness=3)
 
-        # --- bottom-left: sensitivity ---
-        labels = {"strict": "1:STRICT", "normal": "2:NORMAL", "relaxed": "3:RELAXED"}
-        parts = []
-        for key, label in labels.items():
-            if key == self.sensitivity:
-                parts.append(f"[{label}]")
-            else:
-                parts.append(f" {label} ")
-        sens_text = "  ".join(parts)
-        self._put_text(frame, sens_text, (15, h - 15), font, 0.45, (200, 200, 200))
+def draw_skeleton(frame, lm_list, is_bad):
+    h, w = frame.shape[:2]
+    pt_col   = (0, 0, 220) if is_bad else (0, 200, 0)
+    line_col = (0, 0, 180) if is_bad else (0, 160, 0)
 
-        # --- bottom-right: controls ---
-        self._put_text(frame, "q:Quit  c:Recalibrate", (w - 230, h - 15), font, 0.45, (160, 160, 160))
+    for i, j in POSE_CONNECTIONS:
+        a, b = lm_list[i], lm_list[j]
+        if _vis(a) > 0.5 and _vis(b) > 0.5:
+            cv2.line(frame,
+                     (int(a.x*w), int(a.y*h)),
+                     (int(b.x*w), int(b.y*h)),
+                     line_col, 2, cv2.LINE_AA)
 
-    def draw_calibration_overlay(self, frame):
-        """Draw calibration UI (countdown + progress bar)."""
-        h, w = frame.shape[:2]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-
-        countdown, collected, needed = self.calibration_progress()
-
-        if countdown > 0:
-            text = f"Sit in your best posture... {int(countdown) + 1}"
-            text_size = cv2.getTextSize(text, font, 0.85, 2)[0]
-            tx = (w - text_size[0]) // 2
-            ty = (h // 2)
-            self._put_text(frame, text, (tx, ty), font, 0.85, (0, 255, 255), thickness=2)
-        else:
-            text = "Calibrating..."
-            text_size = cv2.getTextSize(text, font, 0.75, 2)[0]
-            tx = (w - text_size[0]) // 2
-            self._put_text(frame, text, (tx, h // 2 - 20), font, 0.75, (0, 255, 255), thickness=2)
-
-            # Progress bar
-            bar_w = 300
-            bar_h = 20
-            bx = (w - bar_w) // 2
-            by = h // 2 + 10
-            progress = collected / needed if needed > 0 else 0
-            cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (100, 100, 100), 2)
-            fill_w = int(bar_w * progress)
-            cv2.rectangle(frame, (bx, by), (bx + fill_w, by + bar_h), (0, 255, 0), -1)
-
-    @staticmethod
-    def _put_text(frame, text, org, font, scale, color, thickness=2):
-        """Draw text with a dark shadow for readability."""
-        cv2.putText(frame, text, (org[0] + 1, org[1] + 1), font, scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
-        cv2.putText(frame, text, org, font, scale, color, thickness, cv2.LINE_AA)
+    for idx in [NOSE, LEFT_EAR, RIGHT_EAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]:
+        lm = lm_list[idx]
+        if _vis(lm) > 0.5:
+            cx, cy = int(lm.x*w), int(lm.y*h)
+            cv2.circle(frame, (cx, cy), 6, pt_col,       -1, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), 6, (255,255,255),  1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    detector = PostureDetector(sensitivity="normal")
+MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+MODEL_FILE = "pose_landmarker_lite.task"
 
-    # Initialize MediaPipe Pose Landmarker
-    print("Loading pose model...")
-    base_options = python.BaseOptions(model_asset_path="pose_landmarker_heavy.task")
-    options = vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        output_segmentation_masks=False,
+
+def main():
+    if not os.path.exists(MODEL_FILE):
+        print("Downloading pose model (~5 MB)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
+        print("Done.")
+
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_base.BaseOptions(model_asset_path=MODEL_FILE),
+        running_mode=mp_vision.RunningMode.VIDEO,
     )
-    pose_landmarker = vision.PoseLandmarker.create_from_options(options)
+    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+
+    global latest_frame
+
+    threading.Thread(target=start_status_server, daemon=True).start()
+    print("Status server running on http://localhost:8765/status")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Could not open webcam.")
         return
 
-    print("=== Are You Shrimpin'? ===")
-    print("Sit in your best posture for calibration...")
-    print("Controls: q=quit  c=recalibrate  1/2/3=sensitivity")
+    detector = PostureDetector()
 
-    calibrating = True
-    calibrated_flash_until = 0.0
+    print("=== Are You Shrimpin'? ===")
+    print(f"Hunch threshold: angle < {HUNCH_THRESHOLD} degrees")
+    print("Controls: q=quit")
 
     while True:
-        success, frame = cap.read()
-        if not success:
+        ok, frame = cap.read()
+        if not ok:
             break
 
-        # Mirror the frame
-        frame = cv2.flip(frame, 1)
-
-        # Convert and detect
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame    = cv2.flip(frame, 1)
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = pose_landmarker.detect(mp_image)
+        ts_ms    = int(time.time() * 1000)
+        result   = landmarker.detect_for_video(mp_image, ts_ms)
 
-        if result.pose_landmarks and len(result.pose_landmarks) > 0:
-            landmarks = result.pose_landmarks[0]
-
-            if calibrating:
-                # Draw skeleton in green during calibration
-                detector.draw_skeleton(frame, landmarks, None)
-                done = detector.calibrate_frame(landmarks)
-                detector.draw_calibration_overlay(frame)
-
-                if done:
-                    calibrating = False
-                    calibrated_flash_until = time.time() + 2.0
-                    print(f"Calibrated! Baseline angle: {detector.baseline_angle:.1f} deg")
-                    print(f"  Entry threshold: {detector.entry_threshold:.1f} deg")
-                    print(f"  Exit threshold:  {detector.exit_threshold:.1f} deg")
-            else:
-                analysis = detector.analyze_posture(landmarks)
-                detector.draw_skeleton(frame, landmarks, analysis)
-                detector.draw_overlay(frame, analysis)
-
-                # "Calibrated!" flash
-                if time.time() < calibrated_flash_until:
-                    h, w = frame.shape[:2]
-                    text = "Calibrated!"
-                    sz = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
-                    detector._put_text(frame, text, ((w - sz[0]) // 2, h // 2),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-                # Sound alert (throttled to every 15 seconds)
-                if analysis["is_shrimping"]:
-                    if time.time() - detector.last_alert_time >= 15:
-                        play_alert_sound()
-                        detector.last_alert_time = time.time()
+        if result.pose_landmarks:
+            lm    = result.pose_landmarks[0]
+            angle = detector.analyze(lm)
+            draw_skeleton(frame, lm, detector.is_hunching)
+            draw_hud(frame, detector, angle)
         else:
-            # No pose detected
-            detector._put_text(frame, "No pose detected - make sure you're visible",
-                               (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255))
+            put_text(frame, "No pose detected — move into frame", (20, 40), 0.65, (0, 0, 255))
 
-        cv2.imshow("Are You Shrimpin'?", frame)
+        _, jpeg = cv2.imencode(".jpg", frame)
+        with frame_lock:
+            latest_frame = jpeg.tobytes()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-        elif key == ord("c"):
-            detector.reset_calibration()
-            calibrating = True
-            print("Recalibrating... sit in your best posture.")
-        elif key == ord("1"):
-            detector.set_sensitivity("strict")
-            print("Sensitivity: STRICT")
-        elif key == ord("2"):
-            detector.set_sensitivity("normal")
-            print("Sensitivity: NORMAL")
-        elif key == ord("3"):
-            detector.set_sensitivity("relaxed")
-            print("Sensitivity: RELAXED")
 
-    # Cleanup
     cap.release()
-    cv2.destroyAllWindows()
-    print(f"\nSession stats: {detector.shrimp_count} shrimp events, "
-          f"{detector.total_bad_seconds:.0f}s total bad posture")
+    landmarker.close()
+    print(f"\nSession ended — total hunches: {detector.hunch_count}")
 
 
 if __name__ == "__main__":
