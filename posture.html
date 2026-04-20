@@ -662,16 +662,30 @@
     }
   });
 
-  // ═══ SOUND/MUSIC BUTTONS (toggle visual only for now) ═══
+  // ═══ SOUND BUTTON (toggle visual only) ═══
   document.getElementById('btn-sound').addEventListener('click', (e) => {
     e.stopPropagation();
     const btn = e.currentTarget;
     btn.style.opacity = btn.style.opacity === '0.4' ? '1' : '0.4';
   });
+
+  // ═══ MUSIC BUTTON ═══
+  const music = new Audio('music.mp3');
+  music.loop = true;
+  let musicPlaying = false;
+
   document.getElementById('btn-music').addEventListener('click', (e) => {
     e.stopPropagation();
     const btn = e.currentTarget;
-    btn.style.opacity = btn.style.opacity === '0.4' ? '1' : '0.4';
+    if (musicPlaying) {
+      music.pause();
+      musicPlaying = false;
+      btn.style.opacity = '0.4';
+    } else {
+      music.play();
+      musicPlaying = true;
+      btn.style.opacity = '1';
+    }
   });
 </script>
 
