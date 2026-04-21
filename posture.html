@@ -576,6 +576,7 @@
 
   // ═══ TIMER ═══
   let timerRunning = false, timerSeconds = 0, timerInterval = null;
+  let shrimpOffset = 0, lastBackendCount = 0;
 
   function toggleTimer() {
     const btn = document.getElementById('btn-start');
@@ -594,8 +595,15 @@
     clearInterval(timerInterval);
     timerRunning = false;
     timerSeconds = 0;
+    shrimpOffset = lastBackendCount;
     updateTimer();
+    document.getElementById('counter').textContent = '00';
     document.getElementById('btn-start').textContent = 'Start';
+    const pt = document.getElementById('posture-text');
+    pt.textContent = "you're doing great, keep it up ~";
+    pt.classList.remove('bad');
+    document.getElementById('status-dot').classList.remove('bad');
+    document.getElementById('status-label').textContent = 'good posture';
   }
 
   function updateTimer() {
@@ -646,12 +654,7 @@
   // ═══ CAMERA — stream from Python detector ═══
   document.getElementById('cam-rec').style.display = 'flex';
 
-  // ═══ SOUND BUTTON (toggle visual only) ═══
-  document.getElementById('btn-sound').addEventListener('click', (e) => {
-    e.stopPropagation();
-    const btn = e.currentTarget;
-    btn.style.opacity = btn.style.opacity === '0.4' ? '1' : '0.4';
-  });
+  // Sound toggle handled in polling script below
 
   // ═══ MUSIC BUTTON ═══
   const music = new Audio('music.mp3');
@@ -674,13 +677,49 @@
 </script>
 
 <script>
-  // Poll Python posture detector and update counter
+  // ═══ SOUND TOGGLE (faah / vine) ═══
+  const sounds = {
+    faah: new Audio('faah.mp3'),
+    vine: new Audio('vine-boom.mp3'),
+  };
+  let selectedSound = 'faah';
+  let soundEnabled  = true;
+
+  document.getElementById('btn-sound').addEventListener('click', (e) => {
+    e.stopPropagation();
+    soundEnabled = !soundEnabled;
+    e.currentTarget.style.opacity = soundEnabled ? '1' : '0.4';
+  }, true);
+
+  // Inject faah/vine buttons next to the sound icon
+  const topRight = document.querySelector('.top-right');
+  topRight.insertAdjacentHTML('afterbegin', `
+    <button class="t-btn t-btn-start" id="btn-faah" style="padding:6px 14px;font-size:12px;" onclick="selectSound('faah')">FAAH</button>
+    <button class="t-btn t-btn-reset" id="btn-vine" style="padding:6px 14px;font-size:12px;" onclick="selectSound('vine')">VINE</button>
+  `);
+
+  function selectSound(name) {
+    selectedSound = name;
+    document.getElementById('btn-faah').className = name === 'faah' ? 't-btn t-btn-start' : 't-btn t-btn-reset';
+    document.getElementById('btn-vine').className = name === 'vine' ? 't-btn t-btn-start' : 't-btn t-btn-reset';
+    document.getElementById('btn-faah').style.cssText = 'padding:6px 14px;font-size:12px;';
+    document.getElementById('btn-vine').style.cssText = 'padding:6px 14px;font-size:12px;';
+  }
+
+  function playAlert() {
+    if (!soundEnabled) return;
+    const s = sounds[selectedSound];
+    s.currentTime = 0;
+    s.play().catch(() => {});
+  }
+
+  // ═══ POLL PYTHON DETECTOR ═══
+  let lastHunching = false;
+
   setInterval(async () => {
     try {
       const res  = await fetch('http://localhost:8765/status');
       const data = await res.json();
-      document.getElementById('counter').textContent =
-        data.count.toString().padStart(2, '0');
 
       const dot   = document.getElementById('status-dot');
       const label = document.getElementById('status-label');
@@ -688,19 +727,39 @@
       const tl    = document.querySelector('.top-left');
 
       tl.style.visibility = 'visible';
+
+      if (!data.calibrated) {
+        const pct = Math.round((data.cal_progress || 0) * 100);
+        const cd  = data.countdown > 0 ? `sit straight... ${Math.ceil(data.countdown)}` : `calibrating ${pct}%`;
+        dot.classList.remove('bad');
+        label.textContent = cd;
+        pt.textContent    = "hold your best posture ~";
+        pt.classList.remove('bad');
+        return;
+      }
+
+      lastBackendCount = data.count || 0;
+
+      if (!timerRunning) return;
+
+      const display = Math.max(0, lastBackendCount - shrimpOffset);
+      document.getElementById('counter').textContent = display.toString().padStart(2, '0');
+
       if (data.is_hunching) {
         dot.classList.add('bad');
         label.textContent = "shrimpin' detected!";
         pt.textContent    = "straighten up, little shrimp!";
         pt.classList.add('bad');
+        if (!lastHunching) playAlert();
       } else {
         dot.classList.remove('bad');
         label.textContent = 'good posture';
         pt.textContent    = "you're doing great, keep it up ~";
         pt.classList.remove('bad');
       }
+      lastHunching = data.is_hunching;
     } catch (_) {}
-  }, 1000);
+  }, 500);
 </script>
 
 </body>
